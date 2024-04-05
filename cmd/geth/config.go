@@ -43,6 +43,7 @@ import (
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/node"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/suave"
 	"github.com/naoina/toml"
 	"github.com/urfave/cli/v2"
 )
@@ -95,6 +96,7 @@ type gethConfig struct {
 	Node     node.Config
 	Ethstats ethstatsConfig
 	Metrics  metrics.Config
+	Suave    suave.Config
 }
 
 func loadConfig(file string, cfg *gethConfig) error {
@@ -131,6 +133,7 @@ func loadBaseConfig(ctx *cli.Context) gethConfig {
 		Eth:     ethconfig.Defaults,
 		Node:    defaultNodeConfig(),
 		Metrics: metrics.DefaultConfig,
+		Suave:   suave.DefaultConfig,
 	}
 
 	// Load config file.
@@ -162,6 +165,7 @@ func makeConfigNode(ctx *cli.Context) (*node.Node, gethConfig) {
 		cfg.Ethstats.URL = ctx.String(utils.EthStatsURLFlag.Name)
 	}
 	applyMetricConfig(ctx, &cfg)
+	utils.SetSuaveConfig(ctx, &cfg.Suave)
 
 	return stack, cfg
 }
@@ -194,7 +198,7 @@ func makeFullNode(ctx *cli.Context) (*node.Node, ethapi.Backend) {
 		cfg.Eth.OverrideVerkle = &v
 	}
 
-	backend, eth := utils.RegisterEthService(stack, &cfg.Eth)
+	backend, eth := utils.RegisterEthService(stack, &cfg.Eth, &cfg.Suave)
 
 	// Create gauge with geth system and build information
 	if eth != nil { // The 'eth' backend may be nil in light mode

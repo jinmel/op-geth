@@ -436,6 +436,14 @@ func (b *EthAPIBackend) StartMining() error {
 	return b.eth.StartMining()
 }
 
+func (b *EthAPIBackend) BuildBlockFromTxs(ctx context.Context, buildArgs *types.BuildBlockArgs, txs types.Transactions) (*types.Block, *big.Int, error) {
+	return b.eth.Miner().BuildBlockFromTxs(ctx, buildArgs, txs)
+}
+
+func (b *EthAPIBackend) BuildBlockFromBundles(ctx context.Context, buildArgs *types.BuildBlockArgs, bundles []types.SBundleFromSuave) (*types.Block, *big.Int, error) {
+	return b.eth.Miner().BuildBlockFromBundles(ctx, buildArgs, bundles)
+}
+
 func (b *EthAPIBackend) StateAtBlock(ctx context.Context, block *types.Block, reexec uint64, base *state.StateDB, readOnly bool, preferDisk bool) (*state.StateDB, tracers.StateReleaseFunc, error) {
 	return b.eth.stateAtBlock(ctx, block, reexec, base, readOnly, preferDisk)
 }
