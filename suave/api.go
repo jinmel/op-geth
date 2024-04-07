@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/ethereum/go-ethereum/beacon/engine"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth"
 	"github.com/ethereum/go-ethereum/log"
@@ -116,6 +117,7 @@ func (api *SuaveAPI) BuildEthBlock(ctx context.Context, buildArgs *types.BuildBl
 }
 
 func (api *SuaveAPI) BuildEthBlockFromBundles(ctx context.Context, buildArgs *types.BuildBlockArgs, bundles []types.SBundleFromSuave) (*engine.ExecutionPayloadEnvelope, error) {
+	log.Info("BuildEthBlockFromBundles", "buildArgs", buildArgs, "bundles", bundles)
 	// HACK: Override buildArgs from the slotAttrs synced from the op-node.
 	buildArgs = &types.BuildBlockArgs{
 		Slot:         api.slotAttrs.Slot,
@@ -125,16 +127,9 @@ func (api *SuaveAPI) BuildEthBlockFromBundles(ctx context.Context, buildArgs *ty
 		GasLimit:     api.slotAttrs.GasLimit,
 		Random:       api.slotAttrs.Random,
 		Withdrawals:  api.slotAttrs.Withdrawals,
-		BeaconRoot:   *api.slotAttrs.ParentBeaconBlockRoot,
+		BeaconRoot:   common.Hash{}, // TODO: add support for beacon root
 		FillPending:  buildArgs.FillPending,
 		Transactions: api.slotAttrs.Transactions,
-	}
-	log.Info("BuildEthBlockFromBundles", "buildArgs", buildArgs, "bundles", bundles)
-
-	for _, bundle := range bundles {
-		for _, tx := range bundle.Txs {
-			log.Info("Transaction dump", "tx", tx)
-		}
 	}
 
 	block, profit, err := api.b.APIBackend.BuildBlockFromBundles(ctx, buildArgs, bundles)
@@ -142,8 +137,12 @@ func (api *SuaveAPI) BuildEthBlockFromBundles(ctx context.Context, buildArgs *ty
 		return nil, err
 	}
 
+	log.Info("Block built", "block", block, "profit", profit, "txs", block.Transactions())
+
 	// TODO: add support for sidecar transactions
-	return engine.BlockToExecutableData(block, profit, nil), nil
+	payload := engine.BlockToExecutableData(block, profit, nil)
+	log.Info("BuildEthBlockFromBundles", "buildArgs", buildArgs, "bundles", bundles, "payload", payload.ExecutionPayload)
+	return payload, nil
 }
 
 func Register(stack *node.Node, backend *eth.Ethereum, cfg *Config) error {

@@ -35,7 +35,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
-	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/eth/tracers"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
@@ -1284,6 +1283,7 @@ func (w *worker) buildBlockFromTxs(ctx context.Context, args *types.BuildBlockAr
 		random:      args.Random,
 		withdrawals: args.Withdrawals,
 		noTxs:       false,
+		txs:         args.Transactions,
 	}
 
 	work, err := w.prepareWork(params)
@@ -1292,15 +1292,27 @@ func (w *worker) buildBlockFromTxs(ctx context.Context, args *types.BuildBlockAr
 	}
 	defer work.discard()
 
-	profitPre := work.state.GetBalance(args.FeeRecipient)
-
-	// handle deposit txs first
-	if err := w.rawCommitTransactions(work, args.Transactions); err != nil {
-		return nil, nil, err
+	// handle forced transactions first
+	for _, tx := range params.txs {
+		from, _ := types.Sender(work.signer, tx)
+		work.state.SetTxContext(tx.Hash(), work.tcount)
+		_, err := w.commitTransaction(work, tx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to force-include tx: %s type: %d sender: %s nonce: %d, err: %w", tx.Hash(), tx.Type(), from, tx.Nonce(), err)
+		}
+		work.tcount++
 	}
+
+	profitPre := work.state.GetBalance(args.FeeRecipient)
 
 	if err := w.rawCommitTransactions(work, txs); err != nil {
 		return nil, nil, err
+	}
+
+	if args.FillPending {
+		if err := w.commitPendingTxs(work); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	profitPost := work.state.GetBalance(args.FeeRecipient)
@@ -1315,25 +1327,16 @@ func (w *worker) buildBlockFromTxs(ctx context.Context, args *types.BuildBlockAr
 func (w *worker) buildBlockFromBundles(ctx context.Context, args *types.BuildBlockArgs, bundles []types.SBundleFromSuave) (*types.Block, *big.Int, error) {
 	log.Info("Running buildBlockFromBundles", "num_bundles", len(bundles), "num_txns", len(args.Transactions))
 
-	for i, bundle := range bundles {
-		log.Info("Dump bundle:", "i", i, "bundle", bundle)
-	}
-	// create ephemeral addr and private key for payment txn
-	ephemeralPrivKey, err := crypto.GenerateKey()
-	if err != nil {
-		return nil, nil, err
-	}
-	ephemeralAddr := crypto.PubkeyToAddress(ephemeralPrivKey.PublicKey)
-
 	params := &generateParams{
 		timestamp:   args.Timestamp,
 		forceTime:   true,
 		parentHash:  args.Parent,
-		coinbase:    ephemeralAddr, // NOTE : overriding BuildBlockArgs.FeeRecipient
+		coinbase:    args.FeeRecipient,
 		gasLimit:    &args.GasLimit,
 		random:      args.Random,
 		withdrawals: args.Withdrawals,
 		noTxs:       false,
+		txs:         args.Transactions,
 	}
 
 	work, err := w.prepareWork(params)
@@ -1341,101 +1344,49 @@ func (w *worker) buildBlockFromBundles(ctx context.Context, args *types.BuildBlo
 		return nil, nil, err
 	}
 	defer work.discard()
-
-	// Assume static 28000 gas transfers for both mev-share and proposer payments
-	refundTransferCost := new(big.Int).Mul(big.NewInt(28000), work.header.BaseFee)
+	if work.gasPool == nil {
+		work.gasPool = new(core.GasPool).AddGas(work.header.GasLimit)
+	}
+	// handle forced transactions first
+	log.Info("Forced transactions", "num_txns", len(params.txs))
+	for _, tx := range params.txs {
+		from, _ := types.Sender(work.signer, tx)
+		work.state.SetTxContext(tx.Hash(), work.tcount)
+		_, err := w.commitTransaction(work, tx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to force-include tx: %s type: %d sender: %s nonce: %d, err: %w", tx.Hash(), tx.Type(), from, tx.Nonce(), err)
+		}
+		work.tcount++
+	}
+	log.Info("Forced transactions done", "num_txns", len(work.txs), "txs", work.txs)
 
 	profitPre := work.state.GetBalance(params.coinbase)
 
-	// handle deposit txs first
-	if err := w.rawCommitTransactions(work, args.Transactions); err != nil {
-		return nil, nil, err
-	}
-
+	// apply bundles
 	for _, bundle := range bundles {
 		// NOTE: failing bundles will cause the block to not be built!
-
 		log.Info("Applying bundle", "bundle", bundle, "num_txns", len(bundle.Txs)) // apply bundle
-		profitPreBundle := work.state.GetBalance(params.coinbase)
-		log.Info("PreBundle:", "profitPreBundle", profitPreBundle)
 		if err := w.rawCommitTransactions(work, bundle.Txs); err != nil {
 			return nil, nil, err
 		}
-		profitPostBundle := work.state.GetBalance(params.coinbase)
-		log.Info("PostBundle:", "profitPostBundle", profitPreBundle)
+	}
 
-		// calc & refund user if bundle has multiple txns and wants refund
-		if len(bundle.Txs) > 1 && bundle.RefundPercent != nil {
-			// Note: PoC logic, this could be gamed by not sending any eth to coinbase
-			refundPrct := *bundle.RefundPercent
-			if refundPrct == 0 {
-				// default refund
-				refundPrct = 10
-			}
-			bundleProfit := new(big.Int).Sub(profitPostBundle, profitPreBundle)
-			refundAmt := new(big.Int).Div(bundleProfit, big.NewInt(int64(refundPrct)))
-			// subtract payment txn transfer costs
-			refundAmt = new(big.Int).Sub(refundAmt, refundTransferCost)
-
-			currNonce := work.state.GetNonce(ephemeralAddr)
-			// HACK to include payment txn
-			// multi refund block untested
-			bidTx := bundle.Txs[0] // NOTE : assumes first txn is refund recipient
-			refundAddr, err := types.Sender(types.LatestSignerForChainID(bidTx.ChainId()), bidTx)
-			if err != nil {
-				return nil, nil, err
-			}
-			paymentTx, err := types.SignTx(types.NewTx(&types.LegacyTx{
-				Nonce:    currNonce,
-				To:       &refundAddr,
-				Value:    refundAmt,
-				Gas:      28000,
-				GasPrice: work.header.BaseFee,
-			}), work.signer, ephemeralPrivKey)
-
-			if err != nil {
-				return nil, nil, err
-			}
-
-			// commit payment txn
-			if err := w.rawCommitTransactions(work, types.Transactions{paymentTx}); err != nil {
-				return nil, nil, err
-			}
+	if args.FillPending {
+		if err := w.commitPendingTxs(work); err != nil {
+			return nil, nil, err
 		}
 	}
 
 	profitPost := work.state.GetBalance(params.coinbase)
-	log.Info("PostBundles:", "profitPost", profitPost)
-	proposerProfit := new(big.Int).Set(profitPost) // = post-pre-transfer_cost
-	proposerProfit = proposerProfit.Sub(profitPost, profitPre)
-	proposerProfit = proposerProfit.Sub(proposerProfit, refundTransferCost)
-	log.Info("Calculating profit", "pre", profitPre, "post", profitPost, "refundTransferCost", refundTransferCost, "proposerProfit", proposerProfit)
-	proposerProfit = big.NewInt(1000)
+	blockProfit := new(big.Int).Sub(profitPost, profitPre)
 
-	currNonce := work.state.GetNonce(ephemeralAddr)
-	paymentTx, err := types.SignTx(types.NewTx(&types.LegacyTx{
-		Nonce:    currNonce,
-		To:       &args.FeeRecipient,
-		Value:    proposerProfit,
-		Gas:      28000,
-		GasPrice: work.header.BaseFee,
-	}), work.signer, ephemeralPrivKey)
-	if err != nil {
-		return nil, nil, fmt.Errorf("could not sign proposer payment: %w", err)
-	}
-
-	// commit payment txn
-	if err := w.rawCommitTransactions(work, types.Transactions{paymentTx}); err != nil {
-		return nil, nil, fmt.Errorf("could not commit proposer payment: %w", err)
-	}
-
-	log.Info("buildBlockFromBundles", "num_bundles", len(bundles), "num_txns", len(work.txs), "signprofit", proposerProfit)
+	log.Info("buildBlockFromBundles", "num_bundles", len(bundles), "num_txns", len(work.txs), "signprofit", blockProfit, "txs", work.txs)
 	// todo: add proper uncle list.
 	block, err := w.engine.FinalizeAndAssemble(w.chain, work.header, work.state, work.txs, []*types.Header{}, work.receipts, params.withdrawals)
 	if err != nil {
 		return nil, nil, err
 	}
-	return block, proposerProfit, nil
+	return block, blockProfit, nil
 }
 
 func (w *worker) rawCommitTransactions(env *environment, txs types.Transactions) error {
@@ -1539,4 +1490,16 @@ func signalToErr(signal int32) error {
 	default:
 		panic(fmt.Errorf("undefined signal %d", signal))
 	}
+}
+
+func (w *worker) commitPendingTxs(work *environment) error {
+	interrupt := new(atomic.Int32)
+	timer := time.AfterFunc(w.newpayloadTimeout, func() {
+		interrupt.Store(commitInterruptTimeout)
+	})
+	defer timer.Stop()
+	if err := w.fillTransactions(nil, work); err != nil {
+		return err
+	}
+	return nil
 }
