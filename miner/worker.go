@@ -1325,7 +1325,7 @@ func (w *worker) buildBlockFromTxs(ctx context.Context, args *types.BuildBlockAr
 }
 
 func (w *worker) buildBlockFromBundles(ctx context.Context, args *types.BuildBlockArgs, bundles []types.SBundleFromSuave) (*types.Block, *big.Int, error) {
-	log.Info("Running buildBlockFromBundles", "num_bundles", len(bundles), "num_txns", len(args.Transactions))
+	fmt.Printf("\033[32mRunning buildBlockFromBundles num_bundles %d num_force_txns %d\033[0m\n", len(bundles), len(args.Transactions))
 
 	params := &generateParams{
 		timestamp:   args.Timestamp,
@@ -1380,7 +1380,7 @@ func (w *worker) buildBlockFromBundles(ctx context.Context, args *types.BuildBlo
 	profitPost := work.state.GetBalance(params.coinbase)
 	blockProfit := new(big.Int).Sub(profitPost, profitPre)
 
-	log.Info("buildBlockFromBundles", "num_bundles", len(bundles), "num_txns", len(work.txs), "signprofit", blockProfit, "txs", work.txs)
+	fmt.Printf("\033[32mbuildBlockFromBundles num_bundles %d num_txns %d signprofit %d \033[0m\n", len(bundles), len(work.txs), blockProfit)
 	// todo: add proper uncle list.
 	block, err := w.engine.FinalizeAndAssemble(w.chain, work.header, work.state, work.txs, []*types.Header{}, work.receipts, params.withdrawals)
 	if err != nil {
