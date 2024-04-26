@@ -1273,6 +1273,172 @@ func (w *worker) getSealingBlock(params *generateParams) *newPayloadResult {
 	}
 }
 
+func (w *worker) buildBlockFromTxs(ctx context.Context, args *types.BuildBlockArgs, txs types.Transactions) (*types.Block, *big.Int, error) {
+	params := &generateParams{
+		timestamp:   args.Timestamp,
+		forceTime:   true,
+		parentHash:  args.Parent,
+		coinbase:    args.FeeRecipient,
+		gasLimit:    &args.GasLimit,
+		random:      args.Random,
+		withdrawals: args.Withdrawals,
+		noTxs:       false,
+		txs:         args.Transactions,
+	}
+
+	work, err := w.prepareWork(params)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer work.discard()
+
+	// handle forced transactions first
+	for _, tx := range params.txs {
+		from, _ := types.Sender(work.signer, tx)
+		work.state.SetTxContext(tx.Hash(), work.tcount)
+		_, err := w.commitTransaction(work, tx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to force-include tx: %s type: %d sender: %s nonce: %d, err: %w", tx.Hash(), tx.Type(), from, tx.Nonce(), err)
+		}
+		work.tcount++
+	}
+
+	profitPre := work.state.GetBalance(args.FeeRecipient)
+
+	if err := w.rawCommitTransactions(work, txs); err != nil {
+		return nil, nil, err
+	}
+
+	if args.FillPending {
+		if err := w.commitPendingTxs(work); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	profitPost := work.state.GetBalance(args.FeeRecipient)
+	block, err := w.engine.FinalizeAndAssemble(w.chain, work.header, work.state, work.txs, []*types.Header{}, work.receipts, params.withdrawals)
+	if err != nil {
+		return nil, nil, err
+	}
+	blockProfit := new(big.Int).Sub(profitPost, profitPre)
+	return block, blockProfit, nil
+}
+
+func (w *worker) buildBlockFromBundles(ctx context.Context, args *types.BuildBlockArgs, bundles []types.SBundleFromSuave) (*types.Block, *big.Int, error) {
+	fmt.Printf("\033[32mRunning buildBlockFromBundles num_bundles %d num_force_txns %d\033[0m\n", len(bundles), len(args.Transactions))
+
+	params := &generateParams{
+		timestamp:   args.Timestamp,
+		forceTime:   true,
+		parentHash:  args.Parent,
+		coinbase:    args.FeeRecipient,
+		gasLimit:    &args.GasLimit,
+		random:      args.Random,
+		withdrawals: args.Withdrawals,
+		noTxs:       false,
+		txs:         args.Transactions,
+	}
+
+	work, err := w.prepareWork(params)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer work.discard()
+	if work.gasPool == nil {
+		work.gasPool = new(core.GasPool).AddGas(work.header.GasLimit)
+	}
+	// handle forced transactions first
+	log.Info("Forced transactions", "num_txns", len(params.txs))
+	for _, tx := range params.txs {
+		from, _ := types.Sender(work.signer, tx)
+		work.state.SetTxContext(tx.Hash(), work.tcount)
+		_, err := w.commitTransaction(work, tx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to force-include tx: %s type: %d sender: %s nonce: %d, err: %w", tx.Hash(), tx.Type(), from, tx.Nonce(), err)
+		}
+		work.tcount++
+	}
+	log.Info("Forced transactions done", "num_txns", len(work.txs), "txs", work.txs)
+
+	profitPre := work.state.GetBalance(params.coinbase)
+
+	// apply bundles
+	for _, bundle := range bundles {
+		// NOTE: failing bundles will cause the block to not be built!
+		log.Info("Applying bundle", "bundle", bundle, "num_txns", len(bundle.Txs)) // apply bundle
+		if err := w.rawCommitTransactions(work, bundle.Txs); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	if args.FillPending {
+		if err := w.commitPendingTxs(work); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	profitPost := work.state.GetBalance(params.coinbase)
+	blockProfit := new(big.Int).Sub(profitPost, profitPre)
+
+	fmt.Printf("\033[32mbuildBlockFromBundles num_bundles %d num_txns %d signprofit %d \033[0m\n", len(bundles), len(work.txs), blockProfit)
+	// todo: add proper uncle list.
+	block, err := w.engine.FinalizeAndAssemble(w.chain, work.header, work.state, work.txs, []*types.Header{}, work.receipts, params.withdrawals)
+	if err != nil {
+		return nil, nil, err
+	}
+	return block, blockProfit, nil
+}
+
+func (w *worker) rawCommitTransactions(env *environment, txs types.Transactions) error {
+	gasLimit := env.header.GasLimit
+	if env.gasPool == nil {
+		env.gasPool = new(core.GasPool).AddGas(gasLimit)
+	}
+
+	// TODO: logs should be a part of the env and returned to whoever requested the block
+	// var coalescedLogs []*types.Log
+
+	for _, tx := range txs {
+		// If we don't have enough gas for any further transactions then we're done.
+		if env.gasPool.Gas() < params.TxGas {
+			log.Trace("Not enough gas for further transactions", "have", env.gasPool, "want", params.TxGas)
+			break
+		}
+		// Error may be ignored here. The error has already been checked
+		// during transaction acceptance in the transaction pool.
+		from, _ := types.Sender(env.signer, tx)
+
+		// Check whether the tx is replay protected. If we're not in the EIP155 hf
+		// phase, start ignoring the sender until we do.
+		if tx.Protected() && !w.chainConfig.IsEIP155(env.header.Number) {
+			log.Trace("Ignoring reply protected transaction", "hash", tx.Hash(), "eip155", w.chainConfig.EIP155Block)
+
+			return fmt.Errorf("invalid reply protected tx %s", tx.Hash())
+		}
+
+		// Start executing the transaction
+		env.state.SetTxContext(tx.Hash(), env.tcount)
+
+		// logs, err := w.commitTransaction(env, tx)
+		_, err := w.commitTransaction(env, tx)
+
+		switch {
+		case errors.Is(err, core.ErrNonceTooLow):
+			log.Debug("Skipping transaction with low nonce", "hash", tx.Hash(), "sender", from, "nonce", tx.Nonce())
+			return err
+		case errors.Is(err, nil):
+			// coalescedLogs = append(coalescedLogs, logs...)
+			env.tcount++
+		default:
+			// Transaction is regarded as invalid, drop all consecutive transactions from
+			// the same sender because of `nonce-too-high` clause.
+			log.Debug("Transaction failed, account skipped", "hash", tx.Hash(), "err", err)
+			return err
+		}
+	}
+	return nil
+}
+
 // isTTDReached returns the indicator if the given block has reached the total
 // terminal difficulty for The Merge transition.
 func (w *worker) isTTDReached(header *types.Header) bool {
@@ -1324,4 +1490,16 @@ func signalToErr(signal int32) error {
 	default:
 		panic(fmt.Errorf("undefined signal %d", signal))
 	}
+}
+
+func (w *worker) commitPendingTxs(work *environment) error {
+	interrupt := new(atomic.Int32)
+	timer := time.AfterFunc(w.newpayloadTimeout, func() {
+		interrupt.Store(commitInterruptTimeout)
+	})
+	defer timer.Stop()
+	if err := w.fillTransactions(nil, work); err != nil {
+		return err
+	}
+	return nil
 }

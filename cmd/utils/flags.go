@@ -69,6 +69,7 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/netutil"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
+	"github.com/ethereum/go-ethereum/suave"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/trie/triedb/hashdb"
 	"github.com/ethereum/go-ethereum/trie/triedb/pathdb"
@@ -588,6 +589,19 @@ var (
 		Usage:     `Hash of the block to full sync to (dev testing feature)`,
 		TakesFile: true,
 		Category:  flags.MiscCategory,
+	}
+
+	// Suave settings
+	SuaveEnabledFlag = &cli.BoolFlag{
+		Name:     "suave",
+		Usage:    "Enable Suave mode",
+		Category: flags.SuaveCategory,
+	}
+
+	SuaveBeaconEndpointFlag = &cli.StringFlag{
+		Name:     "suave.beacon_endpoint",
+		Usage:    "Beacon endpoint.",
+		Category: flags.SuaveCategory,
 	}
 
 	// RPC settings
@@ -1438,6 +1452,11 @@ func SetP2PConfig(ctx *cli.Context, cfg *p2p.Config) {
 	}
 }
 
+func SetSuaveConfig(ctx *cli.Context, cfg *suave.Config) {
+	cfg.Enabled = ctx.IsSet(SuaveEnabledFlag.Name)
+	cfg.BeaconEndpoint = ctx.String(SuaveBeaconEndpointFlag.Name)
+}
+
 // SetNodeConfig applies node-related command line flags to the config.
 func SetNodeConfig(ctx *cli.Context, cfg *node.Config) {
 	SetP2PConfig(ctx, &cfg.P2P)
@@ -1984,11 +2003,19 @@ func SetDNSDiscoveryDefaults(cfg *ethconfig.Config, genesis common.Hash) {
 
 // RegisterEthService adds an Ethereum client to the stack.
 // The second return value is the full node instance.
-func RegisterEthService(stack *node.Node, cfg *ethconfig.Config) (ethapi.Backend, *eth.Ethereum) {
+func RegisterEthService(stack *node.Node, cfg *ethconfig.Config, suaveConfig *suave.Config) (ethapi.Backend, *eth.Ethereum) {
 	backend, err := eth.New(stack, cfg)
 	if err != nil {
 		Fatalf("Failed to register the Ethereum service: %v", err)
 	}
+
+	if suaveConfig.Enabled {
+		log.Info("Enable suave service")
+		if err := suave.Register(stack, backend, suaveConfig); err != nil {
+			Fatalf("Failed to register the suave service: %v", err)
+		}
+	}
+
 	stack.RegisterAPIs(tracers.APIs(backend.APIBackend))
 	return backend.APIBackend, backend
 }

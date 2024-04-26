@@ -160,6 +160,11 @@ var (
 		utils.LogBacktraceAtFlag,
 	}, utils.NetworkFlags, utils.DatabaseFlags)
 
+	suaveFlags = []cli.Flag{
+		utils.SuaveEnabledFlag,
+		utils.SuaveBeaconEndpointFlag,
+	}
+
 	rpcFlags = []cli.Flag{
 		utils.HTTPEnabledFlag,
 		utils.HTTPListenAddrFlag,
@@ -254,6 +259,7 @@ func init() {
 	app.Flags = flags.Merge(
 		nodeFlags,
 		rpcFlags,
+		suaveFlags,
 		consoleFlags,
 		debug.Flags,
 		metricsFlags,
