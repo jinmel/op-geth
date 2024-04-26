@@ -134,14 +134,14 @@ func (api *SuaveAPI) BuildEthBlockFromBundles(ctx context.Context, buildArgs *ty
 
 	block, profit, err := api.b.APIBackend.BuildBlockFromBundles(ctx, buildArgs, bundles)
 	if err != nil {
+		log.Error("error building block", "error", err)
 		return nil, err
 	}
 
-	log.Info("Block built", "block", block, "profit", profit, "txs", block.Transactions())
+	log.Info("Block built", "block", block, "profit", profit, "num_txs", len(block.Transactions()))
 
 	// TODO: add support for sidecar transactions
 	payload := engine.BlockToExecutableData(block, profit, nil)
-	log.Info("BuildEthBlockFromBundles", "buildArgs", buildArgs, "bundles", bundles, "payload", payload.ExecutionPayload)
 	return payload, nil
 }
 
